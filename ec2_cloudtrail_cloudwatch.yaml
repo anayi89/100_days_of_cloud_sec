@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template to deploy an EC2 Instance with a new
+  VPC, subnet and security group.
+
+Resources:
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  # Enable Internet access for the VPC by attaching it to an Internet gateway.
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  MyInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref MyInternetGateway  
+      VpcId: !Ref MyVPC
+
+  MyRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  # Enable IPv4 and IPv6 Internet traffic from the VPC's Internet gateway
+  MyRouteIPv4:
+    Type: AWS::EC2::Route
+    DependsOn: MyInternetGateway
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  MyRouteIPv6:
+    Type: AWS::EC2::Route
+    DependsOn: MyInternetGateway
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      DestinationIpv6CidrBlock: ::/0
+      GatewayId: !Ref MyInternetGateway
+
+  MySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "us-east-2" ]
+      MapPublicIpOnLaunch: true
+
+  # Set the route table as the subnet's default route table
+  MyPublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref MyRouteTable
+      SubnetId: !Ref MySubnet
+
+  # Open ports to access the EC2 instance via web and SSH
+  MySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH and HTTP/S access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  MyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      # Prerequisite: existing key pair with the below name
+      KeyName: my_key_pair
+      ImageId: ami-0e06fa29a08d84162
+      SecurityGroupIds:
+        - !Ref MySecurityGroup
+      SubnetId: !Ref MySubnet
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp2
+      Tags:
+        - Key: Name
+          Value: Blog App
+
+  MyEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref MyInstance
+
+  # S3 Bucket for CloudTrail logs
+  MyCloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  # S3 Bucket Policy
+  MyCloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+        Bucket: !Ref MyCloudTrailBucket
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: cloudtrail.amazonaws.com
+              Action: "s3:PutObject"
+              Resource: !Sub "arn:aws:s3:::${MyCloudTrailBucket}/*"
+              Condition:
+                StringEquals:
+                  s3:x-amz-acl: "bucket-owner-full-control"
+            - Effect: Allow
+              Principal:
+                AWS: "*"
+              Action: "s3:GetBucketAcl"
+              Resource: !Sub "arn:aws:s3:::${MyCloudTrailBucket}"
+
+  # CloudTrail for logging API activity
+  MyCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName: !Ref MyCloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub arn:aws:s3:::${MyCloudTrailBucket}/
+      CloudWatchLogsLogGroupArn: !GetAtt MyCloudWatchLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt MyCloudTrailRole.Arn
+
+  # IAM Role for CloudTrail to push logs to CloudWatch
+  MyCloudTrailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt MyCloudWatchLogGroup.Arn
+
+  # CloudWatch Log Group
+  MyCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  # CloudWatch Alarm for EC2 instance state change
+  MyCloudWatchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm for EC2 instance state change"
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref MyInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref MySNSAlarmTopic
+
+  # SNS Topic for CloudWatch Alarms
+  MySNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "EC2 Alarm Notification"
+
+Outputs:
+  InstanceId:
+    Description: Instance ID of the newly created EC2 instance
+    Value: !Ref MyInstance
+  PublicIP:
+    Description: Public IP address of the EC2 instance
+    Value: !Ref MyEIP
+  VPCId:
+    Description: VPC ID
+    Value: !Ref MyVPC
+  SubnetId:
+    Description: Subnet ID
+    Value: !Ref MySubnet
+  AZ:
+    Description: AZ of the newly created AWS EC2 instance
+    Value: !GetAtt MyInstance.AvailabilityZone
+  PublicDNS:
+    Description: Public DNS Name of the newly created AWS EC2 instance
+    Value: !GetAtt MyInstance.PublicDnsName
+  CloudTrailBucket:
+    Description: S3 Bucket for CloudTrail logs
+    Value: !Ref MyCloudTrailBucket
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for CloudTrail logs
+    Value: !Ref MyCloudWatchLogGroup
